@@ -165,9 +165,11 @@ void Session::Impl::handle_init(
         (opts.uring_payload_bytes + 4095u) / 4096u));
 
     // Sane defaults: advertise EXT (required by fusex), enable URING,
-    // and request PARALLEL_DIROPS for concurrent lookups.
+    // request PARALLEL_DIROPS for concurrent lookups, and ack
+    // WRITEBACK_CACHE so the kernel can update mtime/ctime/size
+    // locally and batch flushes through writepages.
     info.flags = FUSE_INIT_EXT | FUSE_MAX_PAGES | FUSE_PARALLEL_DIROPS
-               | FUSE_OVER_IO_URING;
+               | FUSE_OVER_IO_URING | FUSE_WRITEBACK_CACHE;
 
     if (auto rc = fs->init(info); !rc) { reply_error(r, rc.error()); return; }
 
