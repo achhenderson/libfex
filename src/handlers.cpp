@@ -344,8 +344,11 @@ void Session::Impl::handle_mkobjx(
     const ::fuse_in_header& h, const std::byte* body, std::size_t body_len,
     Replier& r)
 {
-    // Wire: [namesize/flags/spare][struct fuse_statx][name+NUL][link_body?]
-    // (link_body present only for S_IFLNK).
+    // Wire: [ext data][namesize/flags/spare][struct fuse_statx]
+    //       [name+NUL][link_body?] (link_body present only for S_IFLNK).
+    // The kernel's fuse_extension prefix (h.total_extlen * 8 bytes) comes
+    // before the request body proper; every body-relative offset below
+    // is computed against that prefix.
     constexpr std::size_t hdr_sz   = offsetof(::fuse_mkobjx_in, stat);
     constexpr std::size_t stat_off = hdr_sz;
     constexpr std::size_t name_off = stat_off + sizeof(::fuse_statx);
@@ -354,18 +357,20 @@ void Session::Impl::handle_mkobjx(
         reply_error(r, Errc::invalid_argument); return;
     }
     const auto* in = reinterpret_cast<const ::fuse_mkobjx_in*>(body + ext);
-    const auto* sx = reinterpret_cast<const ::fuse_statx*>(body + stat_off);
+    const auto* sx =
+        reinterpret_cast<const ::fuse_statx*>(body + ext + stat_off);
 
-    if (body_len < name_off + in->namesize) {
+    if (body_len < ext + name_off + in->namesize) {
         reply_error(r, Errc::invalid_argument); return;
     }
-    const char* name_ptr = reinterpret_cast<const char*>(body + name_off);
+    const char* name_ptr =
+        reinterpret_cast<const char*>(body + ext + name_off);
     // namesize includes the trailing NUL.
     std::size_t name_len = in->namesize ? (in->namesize - 1u) : 0u;
 
     std::string_view link_body;
     if ((sx->mode & 0xf000u) == 0xa000u /* S_IFLNK */) {
-        const std::size_t after = name_off + in->namesize;
+        const std::size_t after = ext + name_off + in->namesize;
         if (body_len > after) {
             const char* lp = reinterpret_cast<const char*>(body + after);
             const std::size_t lavail = body_len - after;
