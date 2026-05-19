@@ -118,20 +118,38 @@ std::error_code Session::run(Filesystem& fs)
     // fs up by source (xfstests' _check_mounted_on, findmnt, …) see
     // duplicates.
     //
-    // Critical ordering: close /dev/fuse FIRST so the kernel marks
-    // the FUSE connection aborted. Otherwise umount2() blocks for
-    // minutes waiting on FUSE_DESTROY / dirty-page flushes that our
-    // ring workers (already joined here, rings torn down by their
-    // dtors) can no longer service. With the connection aborted,
-    // kill_sb sees -ENOTCONN immediately and umount returns. We use
-    // MNT_DETACH for the same reason: lazy detach, no blocking on
-    // busy refs.
+    // Teardown ordering (matters for fuse_uring_ent freeing):
+    //
+    //   1. umount2(MNT_FORCE | MNT_DETACH) — MNT_FORCE drives the
+    //      kernel through fuse_umount_begin() → fuse_chan_abort() →
+    //      fuse_uring_abort() → fuse_uring_stop_queues() synchronously,
+    //      which walks every ring queue and moves all FRRS_AVAILABLE /
+    //      FRRS_USERSPACE entries to the queue's ent_released list.
+    //      Without MNT_FORCE this only fires later (via fuse_dev_release
+    //      when the file ref hits 0, or via the SB destroy path) and
+    //      can race with refcount drops, leaving entries stuck on
+    //      ent_in_userspace / ent_avail_queue. They then leak when
+    //      fuse_uring_destruct() WARN_ON's a non-empty queue and frees
+    //      only ent_released. fusex doesn't set fc->destroy, so
+    //      MNT_FORCE doesn't trigger any FUSE_DESTROY round-trip; it
+    //      just aborts the channel. MNT_DETACH on top makes the
+    //      namespace detach lazy so we don't block on busy refs.
+    //
+    //   2. dev_fd.reset() — close /dev/fuse. The ring workers have
+    //      already joined and their io_urings have been torn down by
+    //      this point, so no io_uring refs remain on the file. The
+    //      userspace close drops the last ref → fuse_dev_release runs,
+    //      which calls fuse_conn_put() on the conn ref the channel
+    //      took at fuse_dev_install time. With the mount also gone,
+    //      fc refcount hits zero and the RCU delayed_release callback
+    //      fires fuse_uring_destruct(), which kfree()s every entry
+    //      that step 1 moved to ent_released.
     struct UmountOnExit {
         Impl* impl;
         ~UmountOnExit() {
             if (!impl->mount_installed) return;
-            impl->dev_fd.reset();
-            if (::umount2(impl->opts.mountpoint.c_str(), MNT_DETACH) < 0) {
+            if (::umount2(impl->opts.mountpoint.c_str(),
+                          MNT_FORCE | MNT_DETACH) < 0) {
                 const int e = errno;
                 if (e != EINVAL && e != ENOENT) {
                     std::fprintf(stderr,
@@ -140,6 +158,7 @@ std::error_code Session::run(Filesystem& fs)
                         e, ::strerror(e));
                 }
             }
+            impl->dev_fd.reset();
             impl->mount_installed = false;
         }
     } umount_guard{impl_.get()};
