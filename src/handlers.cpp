@@ -12,8 +12,6 @@
 
 #include <algorithm>
 #include <cstddef>
-#include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <utility>
 #include <vector>
@@ -59,57 +57,6 @@ void pack_statx(const StatxOut& src, std::chrono::nanoseconds attr_valid,
     s.rdev_minor      = src.rdev_minor;
     s.dev_major       = src.dev_major;
     s.dev_minor       = src.dev_minor;
-}
-
-// Same FEX_DEBUG gate the passthrough example uses, evaluated once.
-bool debug_enabled() noexcept {
-    static const bool on = [] {
-        const char* e = std::getenv("FEX_DEBUG");
-        return e && *e && *e != '0';
-    }();
-    return on;
-}
-
-const char* opcode_name(std::uint32_t op) noexcept {
-    switch (op) {
-    case FUSE_LOOKUP:        return "LOOKUP";
-    case FUSE_FORGET:        return "FORGET";
-    case FUSE_GETATTR:       return "GETATTR";
-    case FUSE_SETATTR:       return "SETATTR";
-    case FUSE_READLINK:      return "READLINK";
-    case FUSE_SYMLINK:       return "SYMLINK";
-    case FUSE_MKNOD:         return "MKNOD";
-    case FUSE_MKDIR:         return "MKDIR";
-    case FUSE_UNLINK:        return "UNLINK";
-    case FUSE_RMDIR:         return "RMDIR";
-    case FUSE_RENAME:        return "RENAME";
-    case FUSE_LINK:          return "LINK";
-    case FUSE_OPEN:          return "OPEN";
-    case FUSE_READ:          return "READ";
-    case FUSE_WRITE:         return "WRITE";
-    case FUSE_STATFS:        return "STATFS";
-    case FUSE_RELEASE:       return "RELEASE";
-    case FUSE_FSYNC:         return "FSYNC";
-    case FUSE_SETXATTR:      return "SETXATTR";
-    case FUSE_GETXATTR:      return "GETXATTR";
-    case FUSE_LISTXATTR:     return "LISTXATTR";
-    case FUSE_REMOVEXATTR:   return "REMOVEXATTR";
-    case FUSE_FLUSH:         return "FLUSH";
-    case FUSE_INIT:          return "INIT";
-    case FUSE_OPENDIR:       return "OPENDIR";
-    case FUSE_READDIR:       return "READDIR";
-    case FUSE_RELEASEDIR:    return "RELEASEDIR";
-    case FUSE_FSYNCDIR:      return "FSYNCDIR";
-    case FUSE_FALLOCATE:     return "FALLOCATE";
-    case FUSE_RENAME2:       return "RENAME2";
-    case FUSE_STATX:         return "STATX";
-    case FUSE_LOOKUP_ROOT:   return "LOOKUP_ROOT";
-    case FUSE_LOOKUPX:       return "LOOKUPX";
-    case FUSE_MKOBJX:        return "MKOBJX";
-    case FUSE_SETSTATX:      return "SETSTATX";
-    case FUSE_COMPOUND:      return "COMPOUND";
-    default:                 return "?";
-    }
 }
 
 void unpack_statx(const ::fuse_statx& w, SetStatxIn& dst) noexcept {
@@ -198,7 +145,6 @@ void Session::Impl::handle_init(
     out.time_gran      = info.time_gran;
     out.max_pages      = info.max_pages;
 
-    init_done = true;
     reply_pod(r, out);
 }
 
@@ -749,105 +695,19 @@ void Session::Impl::handle_removexattr(
     reply_ok(r);
 }
 
-void Session::Impl::handle_compound(
-    const ::fuse_in_header&, const std::byte* body, std::size_t body_len,
+void Session::Impl::handle_notify_reply(
+    const ::fuse_in_header& h, const std::byte* body, std::size_t body_len,
     Replier& r)
 {
-    // Wire: [fuse_compound_in] {[fuse_compound_req_in][fuse_in_header]
-    // [in_args...]}*. The reply mirrors it: [fuse_compound_out]
-    // {[fuse_out_header][out_args...]}*. The top-level fuse_out_header
-    // is written by the worker around what we put in r.out.
-    if (body_len < sizeof(::fuse_compound_in) ||
-        r.cap   < sizeof(::fuse_compound_out)) {
-        reply_error(r, Errc::invalid_argument); return;
+    // Wire: [fuse_notify_retrieve_in][data]. The kernel doesn't wait for
+    // a reply, but the ring entry only comes back with the commit.
+    const auto* in = in_arg<::fuse_notify_retrieve_in>(h, body, body_len);
+    if (in && body_len - sizeof(*in) >= in->size) {
+        fs->retrieve_reply(make_ctx(h), static_cast<NodeId>(h.nodeid),
+                           (h.unique & ~kRetrieveUnique) >> 1, in->offset,
+                           std::span<const std::byte>{body + sizeof(*in), in->size});
     }
-    std::memset(r.out, 0, sizeof(::fuse_compound_out));
-
-    const std::byte* p       = body + sizeof(::fuse_compound_in);
-    const std::byte* end     = body + body_len;
-    std::byte*       out_p   = r.out + sizeof(::fuse_compound_out);
-    std::byte* const out_end = r.out + r.cap;
-
-    // Per-subop produced nodeids, indexed by subop position. Threaded
-    // into dependent subops' fuse_in_header.nodeid before dispatch -
-    // mirrors fuse_compound_propagate_nodeid() in the kernel's legacy
-    // fallback path, which doesn't run when the daemon (us) handles
-    // compounds itself.
-    std::vector<std::uint64_t> produced;
-
-    const bool log = debug_enabled();
-    if (log) std::fputs("[fex] compound [", stderr);
-
-    while (p < end) {
-        const std::size_t hdrs = sizeof(::fuse_compound_req_in) +
-                                 sizeof(::fuse_in_header);
-        if (static_cast<std::size_t>(end - p) < hdrs ||
-            out_p + sizeof(::fuse_out_header) > out_end) {
-            reply_error(r, Errc::invalid_argument); return;
-        }
-        ::fuse_compound_req_in sub_req;
-        std::memcpy(&sub_req, p, sizeof(sub_req));
-        p += sizeof(::fuse_compound_req_in);
-        ::fuse_in_header sub_h;
-        std::memcpy(&sub_h, p, sizeof(sub_h));
-        p += sizeof(::fuse_in_header);
-
-        if (sub_h.len < sizeof(::fuse_in_header) ||
-            static_cast<std::size_t>(end - p) <
-                sub_h.len - sizeof(::fuse_in_header)) {
-            reply_error(r, Errc::invalid_argument); return;
-        }
-        const std::size_t sub_len = sub_h.len - sizeof(::fuse_in_header);
-
-        if (sub_req.dep_index != FUSE_COMPOUND_NO_DEP &&
-            sub_req.dep_index < produced.size())
-            sub_h.nodeid = produced[sub_req.dep_index];
-
-        if (log) {
-            if (!produced.empty()) std::fputc(',', stderr);
-            std::fputs(opcode_name(sub_h.opcode), stderr);
-            if (sub_req.dep_index != FUSE_COMPOUND_NO_DEP)
-                std::fprintf(stderr, "^%u", sub_req.dep_index);
-        }
-
-        Replier sub_r{ .out    = out_p + sizeof(::fuse_out_header),
-                       .cap    = static_cast<std::size_t>(out_end - out_p) -
-                                 sizeof(::fuse_out_header),
-                       .unique = sub_h.unique };
-        if (sub_h.opcode == FUSE_COMPOUND)
-            reply_error(sub_r, Errc::operation_not_supported);
-        else
-            dispatch(sub_h, p, sub_len, sub_r);
-        p += sub_len;
-
-        // Entry-producing opcodes return fuse_entry{x,}_out, both of
-        // which have the nodeid as their first u64. Anything else
-        // contributes 0 to the produced[] slot.
-        std::uint64_t prod = 0;
-        if (!sub_r.neg_err && sub_r.len >= sizeof(prod)) {
-            switch (sub_h.opcode) {
-            case FUSE_LOOKUPX:
-            case FUSE_MKOBJX:
-            case FUSE_LOOKUP_ROOT:
-                std::memcpy(&prod, sub_r.out, sizeof(prod));
-                break;
-            }
-        }
-        produced.push_back(prod);
-
-        ::fuse_out_header oh{ .len    = static_cast<std::uint32_t>(
-                                  sizeof(::fuse_out_header) +
-                                  (sub_r.neg_err ? 0u : sub_r.len)),
-                              .error  = sub_r.neg_err,
-                              .unique = sub_h.unique };
-        std::memcpy(out_p, &oh, sizeof(oh));
-        out_p += oh.len;
-    }
-
-    if (log) std::fputs("]\n", stderr);
-
-    r.neg_err = 0;
-    r.len     = static_cast<std::size_t>(out_p - r.out);
+    reply_ok(r);
 }
 
 // -----------------------------------------------------------------------
@@ -889,7 +749,10 @@ void Session::Impl::dispatch(const ::fuse_in_header& h,
     case FUSE_SETXATTR:    handle_setxattr   (h, body, body_len, r); break;
     case FUSE_LISTXATTR:   handle_listxattr  (h, body, body_len, r); break;
     case FUSE_REMOVEXATTR: handle_removexattr(h, body, body_len, r); break;
-    case FUSE_COMPOUND:    handle_compound   (h, body, body_len, r); break;
+    case FUSE_NOTIFY_REPLY: handle_notify_reply(h, body, body_len, r); break;
+    // Nothing to do yet: Session::run() calls Filesystem::destroy() once
+    // the workers have stopped.
+    case FUSE_DESTROY:     reply_ok(r); break;
     default:
         reply_error(r, Errc::function_not_supported);
         break;

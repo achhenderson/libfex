@@ -20,8 +20,13 @@
 
 #include <fcntl.h>            // AT_FDCWD
 #include <linux/mount.h>      // FSCONFIG_*, MOVE_MOUNT_*, FSMOUNT_*
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+
+#ifndef STATX_MNT_ID_UNIQUE
+#define STATX_MNT_ID_UNIQUE 0x4000U
+#endif
 
 // -----------------------------------------------------------------------
 // Syscall wrappers. glibc 2.36+ exposes fsopen/fsconfig/fsmount/move_mount
@@ -140,8 +145,15 @@ std::error_code Session::Impl::mount_create_and_finish(UniqueFd fsfd)
 
     // Mount now lives in the namespace; Session::run() must umount on
     // teardown so a crashed/exited daemon doesn't leave stale entries
-    // in /proc/self/mountinfo for the next run.
-    mount_installed = true;
+    // in /proc/self/mountinfo for the next run. Only this mount though,
+    // it may be gone by then.
+    struct ::statx stx;
+    if (::statx(mntfd, "", AT_EMPTY_PATH | AT_STATX_DONT_SYNC,
+                STATX_MNT_ID_UNIQUE, &stx) == 0 &&
+        (stx.stx_mask & STATX_MNT_ID_UNIQUE)) {
+        mount_id = stx.stx_mnt_id;
+        mount_installed = true;
+    }
 
     // Once moved into place, the mount fd may be closed; the actual
     // mount persists in the namespace.

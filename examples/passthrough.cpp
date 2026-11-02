@@ -37,6 +37,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <sys/sysmacros.h>
@@ -326,16 +327,14 @@ public:
 
         // Prefer the open fd (ftruncate/fchmod/futimens directly). Fall
         // back to /proc/self/fd<N> for path-based calls when the caller
-        // didn't open the file (chmod/chown/utimensat from a path, or
+        // didn't open the file (chmod/utimensat from a path, or
         // truncate(2) without an fd).
+        auto inode = table_.get(n);
+        if (!inode) return stale();
         int fd = file_fd(fh);
         char proc[64];
-        if (fd < 0) {
-            auto inode = table_.get(n);
-            if (!inode) return stale();
-            std::snprintf(proc, sizeof(proc), "/proc/self/fd/%d",
-                          inode->path_fd.get());
-        }
+        std::snprintf(proc, sizeof(proc), "/proc/self/fd/%d",
+                      inode->path_fd.get());
 
         if (in.mask & fex::statx_mask::mode) {
             int r = (fd >= 0) ? ::fchmod(fd, in.mode)
@@ -345,8 +344,10 @@ public:
         if (in.mask & (fex::statx_mask::uid | fex::statx_mask::gid)) {
             uid_t u = (in.mask & fex::statx_mask::uid) ? in.uid : (uid_t)-1;
             gid_t g = (in.mask & fex::statx_mask::gid) ? in.gid : (gid_t)-1;
+            // lchown() on the /proc link would change the link itself.
             int r = (fd >= 0) ? ::fchown(fd, u, g)
-                              : ::lchown(proc, u, g);
+                              : ::fchownat(inode->path_fd.get(), "", u, g,
+                                           AT_EMPTY_PATH);
             if (r < 0) return wrap_errno();
         }
         if (in.mask & fex::statx_mask::size) {
@@ -390,6 +391,16 @@ public:
                               O_TMPFILE | O_RDWR | O_CLOEXEC,
                               mode & 07777);
             if (fd < 0) return wrap_errno();
+            // The kernel checks that the owner is the one it asked for.
+            if (::fchown(fd, mi.stat.uid, mi.stat.gid) < 0 && errno != EPERM) {
+                ::close(fd);
+                return wrap_errno();
+            }
+            // chown clears setuid and setgid.
+            if ((mode & (S_ISUID | S_ISGID)) && ::fchmod(fd, mode & 07777) < 0) {
+                ::close(fd);
+                return wrap_errno();
+            }
             struct ::stat st;
             if (::fstat(fd, &st) < 0) { ::close(fd); return wrap_errno(); }
             // Re-open via /proc to get a stable O_PATH fd.
@@ -426,17 +437,20 @@ public:
         }
         if (ret < 0) return wrap_errno();
 
-        // Best-effort: set owner from the requested stat so the new
-        // object inherits the requesting caller's uid/gid even if
-        // we're running as a different user.
-        if (kind != S_IFLNK) {
-            if (::fchownat(p->path_fd.get(), nm.c_str(),
-                           mi.stat.uid, mi.stat.gid,
-                           AT_SYMLINK_NOFOLLOW) < 0) {
-                // Non-fatal; ignore EPERM (unprivileged daemon).
-                if (errno != EPERM) return wrap_errno();
-            }
+        // Set owner from the requested stat so the new object inherits
+        // the requesting caller's uid/gid even if we're running as a
+        // different user. The kernel checks the owner and mode of the new
+        // inode against what it asked for and fails the create otherwise.
+        if (::fchownat(p->path_fd.get(), nm.c_str(),
+                       mi.stat.uid, mi.stat.gid,
+                       AT_SYMLINK_NOFOLLOW) < 0) {
+            // Non-fatal; ignore EPERM (unprivileged daemon).
+            if (errno != EPERM) return wrap_errno();
         }
+        // chown clears setuid and setgid.
+        if (kind != S_IFLNK && (mode & (S_ISUID | S_ISGID)) &&
+            ::fchmodat(p->path_fd.get(), nm.c_str(), mode & 07777, 0) < 0)
+            return wrap_errno();
         (void)ctx;
 
         int cfd = ::openat(p->path_fd.get(), nm.c_str(),
@@ -951,6 +965,17 @@ int main(int argc, char** argv)
     }
     const char* backing    = argv[ai];
     const char* mountpoint = argv[ai + 1];
+
+    // The kernel already applied the caller's umask to the mode of a new
+    // object and insists on that exact mode.
+    ::umask(0);
+
+    // One O_PATH fd per inode the kernel knows about.
+    struct rlimit rl;
+    if (::getrlimit(RLIMIT_NOFILE, &rl) == 0) {
+        rl.rlim_cur = rl.rlim_max;
+        (void)::setrlimit(RLIMIT_NOFILE, &rl);
+    }
 
     int rfd = ::open(backing, O_PATH | O_DIRECTORY | O_CLOEXEC);
     if (rfd < 0) {

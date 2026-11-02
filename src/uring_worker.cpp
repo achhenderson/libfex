@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: BSD-2-Clause OR GPL-2.0-only
 //
-// Per-queue io_uring worker. Each RingWorker owns one io_uring instance
-// and a contiguous block of entry buffers. The thread's job is to keep
-// `queue_depth` entries armed (kernel-side) at all times: every time a
-// CQE arrives the worker processes the request and immediately submits
+// io_uring worker. Each RingWorker owns one io_uring instance and the
+// entries of its FUSE queues. The thread's job is to keep `queue_depth`
+// entries per queue armed (kernel-side) at all times: every time a CQE
+// arrives the worker processes the request and immediately submits
 // FUSE_IO_URING_CMD_COMMIT_AND_FETCH on the same SQE to post the reply
 // AND re-arm for the next request. The only way out of the loop is the
-// shared stop eventfd, which every ring has armed via
-// IORING_OP_POLL_ADD.
+// shared ring stop eventfd, which every ring has armed via
+// IORING_OP_POLL_ADD, or the kernel ending the connection.
 
 #include "uring_worker.hpp"
 
@@ -19,6 +19,7 @@
 
 #include <poll.h>
 #include <sys/mman.h>
+#include <sys/prctl.h>
 
 namespace fex::detail {
 
@@ -46,7 +47,7 @@ void RingWorker::prep_register(io_uring_sqe* sqe, std::uint32_t i) noexcept
 
     auto* cmd = reinterpret_cast<::fuse_uring_cmd_req*>(&sqe->cmd);
     std::memset(cmd, 0, sizeof(*cmd));
-    cmd->qid = static_cast<std::uint16_t>(qid_);
+    cmd->qid = static_cast<std::uint16_t>(e.qid);
 
     io_uring_sqe_set_data64(sqe, make_ud(i));
 }
@@ -65,7 +66,7 @@ void RingWorker::prep_commit_and_fetch(io_uring_sqe* sqe, std::uint32_t i,
 
     auto* cmd = reinterpret_cast<::fuse_uring_cmd_req*>(&sqe->cmd);
     std::memset(cmd, 0, sizeof(*cmd));
-    cmd->qid       = static_cast<std::uint16_t>(qid_);
+    cmd->qid       = static_cast<std::uint16_t>(e.qid);
     cmd->commit_id = commit_id;
 
     io_uring_sqe_set_data64(sqe, make_ud(i));
@@ -75,7 +76,9 @@ std::error_code RingWorker::start()
 {
     // Pre-allocate all entry buffers up front; if any allocation
     // fails we tear down everything (entries_ is owning).
-    entries_.resize(depth_);
+    entries_.resize(qids_.size() * depth_);
+    for (std::size_t i = 0; i < entries_.size(); ++i)
+        entries_[i].qid = qids_[i / depth_];
     const std::size_t buf_len = sizeof(::fuse_uring_req_header) + payload_bytes_;
     for (auto& e : entries_) {
         // Page-align so the kernel's copy_to_user paths stay happy on
@@ -92,41 +95,50 @@ std::error_code RingWorker::start()
         e.iov[0].iov_len  = sizeof(::fuse_uring_req_header);
         e.iov[1].iov_base = e.buf + sizeof(::fuse_uring_req_header);
         e.iov[1].iov_len  = payload_bytes_;
-        // Reassembly scratch for handler dispatch. 128B op_in fits in
-        // any case; the variable part is the trailing payload.
-        e.body_scratch.resize(FUSE_URING_OP_IN_OUT_SZ + payload_bytes_);
     }
+    // 128B op_in fits in any case; the variable part is the trailing
+    // payload.
+    scratch_.resize(FUSE_URING_OP_IN_OUT_SZ + payload_bytes_);
 
     // FUSE-over-io_uring requires both SQE128 and CQE32:
-    //   - SQE128: fuse_uring_cmd_req is 24 bytes and lives in the SQE
-    //     cmd area, which only has 16 bytes in a normal SQE.
+    //   - SQE128: fuse_uring_cmd_req lives in the SQE cmd area, which
+    //     only has 16 bytes in a normal SQE.
     //   - CQE32:  the kernel's fuse_uring_register() rejects with
     //     -EINVAL if IO_URING_F_CQE32 isn't set on the cmd.
-    // The queue depth must accommodate `depth_` request entries plus
-    // one poll slot for stop.
+    // Every entry can have a completion outstanding, plus the stop poll.
+    // The REGISTERs are submitted in batches if the SQ is smaller.
+    const unsigned total = static_cast<unsigned>(entries_.size()) + 1;
+    const unsigned ring_entries = std::min(total, 4096u);
     io_uring_params params{};
-    params.flags = IORING_SETUP_SQE128 | IORING_SETUP_CQE32;
-    const unsigned ring_entries = depth_ + 1;
+    params.flags = IORING_SETUP_SQE128 | IORING_SETUP_CQE32 |
+                   IORING_SETUP_CQSIZE | IORING_SETUP_CLAMP;
+    params.cq_entries = std::max(total, 2 * ring_entries);
     int rc = io_uring_queue_init_params(ring_entries, &ring_, &params);
     if (rc < 0)
         return {-rc, std::system_category()};
     ring_inited_ = true;
 
     // Submit one POLL_ADD on the stop eventfd, tagged with the stop
-    // sentinel. The kernel never completes this until stop() writes
+    // sentinel. The kernel never completes this until run() writes
     // to the eventfd, at which point every ring's poll fires.
     {
         io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
         if (!sqe) return {EAGAIN, std::system_category()};
-        io_uring_prep_poll_add(sqe, impl_.stop_efd.get(), POLLIN);
+        io_uring_prep_poll_add(sqe, impl_.ring_stop_efd.get(), POLLIN);
         io_uring_sqe_set_data64(sqe, kStopSentinel);
     }
 
     // REGISTER each entry. The kernel keeps these pending until a
     // request shows up on this queue, then completes the matching SQE
     // with the request laid out in the entry buffer.
-    for (std::uint32_t i = 0; i < depth_; ++i) {
+    for (std::uint32_t i = 0; i < entries_.size(); ++i) {
         io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
+        if (!sqe) {
+            rc = io_uring_submit(&ring_);
+            if (rc < 0)
+                return {-rc, std::system_category()};
+            sqe = io_uring_get_sqe(&ring_);
+        }
         if (!sqe) return {EAGAIN, std::system_category()};
         prep_register(sqe, i);
     }
@@ -164,7 +176,7 @@ std::uint32_t RingWorker::handle_one(std::uint32_t i) noexcept
     const std::size_t body_len = first_arg_sz + payload_sz;
 
     if (first_arg_sz > FUSE_URING_OP_IN_OUT_SZ ||
-        body_len > e.body_scratch.size()) {
+        body_len > scratch_.size()) {
         auto* outh = reinterpret_cast<::fuse_out_header*>(req->in_out);
         outh->unique = h_copy.unique;
         outh->error  = -EIO;
@@ -174,9 +186,9 @@ std::uint32_t RingWorker::handle_one(std::uint32_t i) noexcept
     }
 
     if (first_arg_sz)
-        std::memcpy(e.body_scratch.data(), req->op_in, first_arg_sz);
+        std::memcpy(scratch_.data(), req->op_in, first_arg_sz);
     if (payload_sz)
-        std::memcpy(e.body_scratch.data() + first_arg_sz,
+        std::memcpy(scratch_.data() + first_arg_sz,
                     e.buf + sizeof(::fuse_uring_req_header),
                     payload_sz);
 
@@ -185,7 +197,7 @@ std::uint32_t RingWorker::handle_one(std::uint32_t i) noexcept
     r.cap    = payload_bytes_;
     r.unique = h_copy.unique;
 
-    impl_.dispatch(h_copy, e.body_scratch.data(), body_len, r);
+    impl_.dispatch(h_copy, scratch_.data(), body_len, r);
 
     // Write the reply header on top of the in_out region.
     auto* outh = reinterpret_cast<::fuse_out_header*>(req->in_out);
@@ -202,6 +214,11 @@ std::uint32_t RingWorker::handle_one(std::uint32_t i) noexcept
 
 void RingWorker::run()
 {
+    // Requests for this mount can depend on this thread making progress, so
+    // its memory allocations must not reclaim from filesystems or wait for
+    // dirty pages. Needs CAP_SYS_RESOURCE, which a root daemon has.
+    (void)::prctl(PR_SET_IO_FLUSHER, 1, 0, 0, 0);
+
     bool stop = false;
     while (!stop) {
         io_uring_cqe* cqe = nullptr;
@@ -234,10 +251,13 @@ void RingWorker::run()
         }
 
         if (res < 0) {
-            // -ENOTCONN means the filesystem is being torn down; -EAGAIN
-            // can come from io_uring under memory pressure. Either way,
-            // we exit cleanly.
-            if (res == -ENOTCONN || res == -ENODEV) { stop = true; break; }
+            // The filesystem is being torn down, or the connection was
+            // aborted, or this task's commands were cancelled.
+            if (res == -ENOTCONN || res == -ENODEV ||
+                res == -ECONNABORTED || res == -ECANCELED) {
+                stop = true;
+                break;
+            }
             if (res == -EINTR) {
                 // Re-arm the slot with another REGISTER.
                 io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
@@ -247,7 +267,7 @@ void RingWorker::run()
             // Other errors: surface and stop.
             std::fprintf(stderr,
                 "fex worker[qid=%u]: CQE res=%d (%s) for entry idx=%u\n",
-                qid_, res, ::strerror(-res), idx);
+                entries_[idx].qid, res, ::strerror(-res), idx);
             ec_ = {-res, std::system_category()};
             stop = true;
             break;
@@ -276,6 +296,10 @@ void RingWorker::run()
             break;
         }
     }
+
+    // A worker that gave up can't serve its queues any more, and nothing
+    // else tells run(). The kernel would wait for it forever.
+    impl_.worker_exited();
 }
 
 void RingWorker::teardown() noexcept

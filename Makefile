@@ -15,13 +15,14 @@ BUILD      ?= build
 LIB        := $(BUILD)/libfex.a
 SO         := $(BUILD)/libfex.so.0.1.0
 BIN        := $(BUILD)/fex-passthrough
+TEST       := $(BUILD)/fex-notify-test
 
 LIB_SRCS   := src/session.cpp src/handlers.cpp src/mount.cpp \
-              src/uring_worker.cpp src/reply.cpp
+              src/uring_worker.cpp src/notifier.cpp src/reply.cpp
 LIB_OBJS   := $(LIB_SRCS:%.cpp=$(BUILD)/%.o)
 
 .PHONY: all clean install
-all: $(LIB) $(SO) $(BIN)
+all: $(LIB) $(SO) $(BIN) $(TEST)
 
 $(BUILD)/%.o: %.cpp
 	@mkdir -p $(@D)
@@ -38,6 +39,9 @@ $(SO): $(LIB_OBJS)
 	ln -sf libfex.so.0     $(BUILD)/libfex.so
 
 $(BIN): examples/passthrough.cpp $(LIB)
+	$(CXX) $(CXXFLAGS) $< $(LIB) -o $@ $(LDFLAGS)
+
+$(TEST): examples/notify_test.cpp $(LIB)
 	$(CXX) $(CXXFLAGS) $< $(LIB) -o $@ $(LDFLAGS)
 
 -include $(LIB_OBJS:.o=.d)

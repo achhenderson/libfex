@@ -6,10 +6,9 @@
 // Conventions:
 //
 // - Every callback runs on one of the session's io_uring worker threads.
-//   Up to `SessionOptions::uring_queues * uring_queue_depth` callbacks
-//   may execute concurrently across different nodeids and even on the
-//   same nodeid — FUSE_PARALLEL_DIROPS is negotiated, and the kernel
-//   routes requests to whichever queue it picks. Filesystem
+//   Callbacks may execute concurrently across different nodeids and even
+//   on the same nodeid — the kernel routes requests to the queue of the
+//   CPU it runs on. Filesystem
 //   implementations MUST be thread-safe; the dispatcher takes no lock
 //   on behalf of the daemon.
 //
@@ -20,11 +19,9 @@
 //   return std::unexpected{std::errc::…}.
 //
 // - The default implementations all return std::errc::function_not_supported
-//   so daemons override only what they need. Regular files get
-//   open()/release() callbacks (mirroring the classic FUSE protocol);
-//   reads/writes/fallocate carry the FileHandle the daemon returned
-//   at open time. Writes from writeback have no file context and
-//   arrive with fh=FileHandle{0}.
+//   so daemons override only what they need. The kernel doesn't open
+//   regular files on the daemon: reads/writes/fallocate arrive with
+//   fh=FileHandle{0}.
 
 #pragma once
 
@@ -52,9 +49,9 @@ public:
         return {};
     }
 
-    // FUSE_DESTROY equivalent (called from the session destructor; the
-    // kernel does not send a wire DESTROY for fusex, but we still invoke
-    // this for symmetry).
+    // Called once when Session::run() ends after a successful mount, with
+    // all the workers stopped. The kernel has sent FUSE_DESTROY by then if
+    // this is the end of an unmount.
     virtual void destroy() noexcept {}
 
     // FUSE_LOOKUP_ROOT (opcode 54): give the kernel the root inode's
@@ -70,16 +67,15 @@ public:
     virtual std::expected<EntryOut, Errc>
     lookupx(const Context& ctx, NodeId parent, std::string_view name) = 0;
 
-    // FUSE_FORGET (opcode 2) / FUSE_BATCH_FORGET (opcode 42). Sent when
-    // the kernel's VFS dentry/inode cache evicts an entry; `nlookup` is
-    // the count to subtract from the daemon's per-inode refcount, which
-    // tracks how many successful lookups/mkobjx replies the kernel has
-    // observed minus how many FORGETs it has sent. When the refcount
-    // reaches zero the daemon may drop its inode state.
+    // FUSE_FORGET (opcode 2). Sent when the kernel evicts an inode;
+    // `nlookup` is the count to subtract from the daemon's per-inode
+    // refcount, which tracks how many successful lookups/mkobjx replies
+    // the kernel has observed minus how many FORGETs it has sent. When the
+    // refcount reaches zero the daemon may drop its inode state. There are
+    // no FORGETs for what the kernel still has at unmount.
     //
-    // FORGET has no reply on the wire — the kernel doesn't wait for one.
-    // The dispatcher still calls into the daemon synchronously on a
-    // ring worker thread; keep the implementation cheap and noexcept.
+    // The dispatcher calls into the daemon synchronously on a ring worker
+    // thread; keep the implementation cheap and noexcept.
     virtual void forget(NodeId nodeid, std::uint64_t nlookup) noexcept {
         (void)nodeid; (void)nlookup;
     }
@@ -163,11 +159,8 @@ public:
         return std::unexpected{Errc::function_not_supported};
     }
 
-    // FUSE_OPEN (opcode 14) / FUSE_RELEASE (opcode 18). open() runs
-    // once per open(2) on a regular file and returns an opaque
-    // FileHandle the kernel threads back on read/write/fallocate/
-    // ftruncate-style setstatx and on release() at close-time. fh=0
-    // is a legal return for daemons that don't need per-fd state.
+    // FUSE_OPEN (opcode 14) / FUSE_RELEASE (opcode 18). The fusex kernel
+    // doesn't send these today.
     virtual std::expected<OpenOut, Errc>
     open(const Context& ctx, NodeId nodeid, std::uint32_t flags) {
         (void)ctx; (void)nodeid; (void)flags;
@@ -183,9 +176,7 @@ public:
 
     // FUSE_READ (opcode 15). Fill `out` with up to `out.size()` bytes
     // starting at `offset`. Return the number actually written. The
-    // dispatcher zero-fills the tail if the daemon returns short.
-    // `fh` is what open() returned, or 0 for kernel-internal reads
-    // (e.g. readahead with no file context).
+    // kernel zero-fills the tail if the daemon returns short. `fh` is 0.
     virtual std::expected<std::size_t, Errc>
     read(const Context& ctx, NodeId nodeid, FileHandle fh,
          std::uint64_t offset, std::span<std::byte> out) {
@@ -195,9 +186,7 @@ public:
 
     // FUSE_WRITE (opcode 16). Consume `in` starting at `offset`.
     // Return the number of bytes accepted; the kernel verifies that
-    // it equals `in.size()` and -EIOs the request otherwise. `fh` is
-    // 0 for writes coming out of writeback (the writer may have
-    // closed before the page reaches the daemon).
+    // it equals `in.size()` and -EIOs the request otherwise. `fh` is 0.
     virtual std::expected<std::size_t, Errc>
     write(const Context& ctx, NodeId nodeid, FileHandle fh,
           std::uint64_t offset, std::span<const std::byte> in) {
@@ -280,6 +269,15 @@ public:
     removexattr(const Context& ctx, NodeId nodeid, std::string_view name) {
         (void)ctx; (void)nodeid; (void)name;
         return std::unexpected{Errc::function_not_supported};
+    }
+
+    // FUSE_NOTIFY_REPLY (opcode 41): the answer to Session::notify_retrieve().
+    // `data` is what the kernel had cached from `offset` on, possibly less
+    // than was asked for or nothing.
+    virtual void retrieve_reply(const Context& ctx, NodeId nodeid, std::uint64_t cookie,
+                                std::uint64_t offset,
+                                std::span<const std::byte> data) noexcept {
+        (void)ctx; (void)nodeid; (void)cookie; (void)offset; (void)data;
     }
 };
 

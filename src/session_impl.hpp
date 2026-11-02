@@ -26,11 +26,18 @@
 #include <cstdint>
 #include <cstring>
 #include <expected>
+#include <memory>
 #include <span>
 #include <system_error>
 #include <utility>
 
 namespace fex {
+
+namespace detail { class Notifier; }
+
+// notify_unique of a FUSE_NOTIFY_RETRIEVE: the cookie shifted past
+// FUSE_INT_REQ_BIT, above the unique values the kernel uses.
+inline constexpr std::uint64_t kRetrieveUnique = 1ull << 62;
 
 // -----------------------------------------------------------------------
 // Replier
@@ -111,12 +118,29 @@ struct Session::Impl {
     SessionOptions    opts;
     UniqueFd          dev_fd;
     Filesystem*       fs = nullptr;
-    UniqueFd          stop_efd;          // eventfd workers poll for shutdown
-    std::atomic<bool> stopping{false};
-    bool              init_done = false; // set when INIT reply has been sent
+    UniqueFd          stop_efd;          // eventfd run() waits on
+    UniqueFd          ring_stop_efd;     // eventfd the ring workers poll
+    std::atomic<bool> stopping{false};   // stop() was called
+    std::atomic<bool> worker_gone{false};
     bool              mount_installed = false; // move_mount succeeded; umount on teardown
+    std::uint64_t     mount_id = 0;      // to find out if it's still ours
+    std::unique_ptr<detail::Notifier> notifier;
 
-    explicit Impl(SessionOptions o) : opts(std::move(o)) {}
+    explicit Impl(SessionOptions o);
+    ~Impl();
+
+    // Wake run() to shut down. Async-signal-safe.
+    void request_stop() noexcept;
+
+    // A worker ended, which can be the connection going away.
+    void worker_exited() noexcept;
+
+    // Write back what is dirty while the workers still serve.
+    void sync_mount() noexcept;
+
+    // Unmount with MNT_FORCE, which aborts the connection, if the mount
+    // at the mountpoint is still ours.
+    void detach_mount() noexcept;
 
     // ----- dispatch -----------------------------------------------------
 
@@ -172,7 +196,7 @@ struct Session::Impl {
     void handle_setxattr   (const ::fuse_in_header&, const std::byte*, std::size_t, Replier&);
     void handle_listxattr  (const ::fuse_in_header&, const std::byte*, std::size_t, Replier&);
     void handle_removexattr(const ::fuse_in_header&, const std::byte*, std::size_t, Replier&);
-    void handle_compound   (const ::fuse_in_header&, const std::byte*, std::size_t, Replier&);
+    void handle_notify_reply(const ::fuse_in_header&, const std::byte*, std::size_t, Replier&);
 
     // Pure dispatch: pick the handler by h.opcode and call it. No I/O.
     void dispatch(const ::fuse_in_header& h,

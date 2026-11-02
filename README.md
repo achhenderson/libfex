@@ -37,22 +37,24 @@ read/write/readlink, opendir/releasedir/readdir, statfs, fallocate,
 getxattr/setxattr/listxattr/removexattr, plus INIT negotiation.
 Includes a worked passthrough example.
 
-Threading: the session spawns `SessionOptions::uring_queues` worker
+Threading: the session spawns `SessionOptions::uring_threads` worker
 threads (default = `hardware_concurrency()`, clamped to [1,32]), each
-owning one io_uring with `uring_queue_depth` pre-registered entries.
-The mount-time handshake (INIT/LOOKUP_ROOT/STATX) runs on a temporary
-`read()/writev()` path because the kernel won't accept ring
-registration before INIT; everything afterwards is io_uring only.
-Filesystem callbacks may run concurrently — implementations must be
-thread-safe.
+owning one io_uring. The kernel has one FUSE queue per possible CPU and
+doesn't serve anything before each has an entry, so all the queues are
+registered, `uring_queue_depth` entries each, and divided among the
+threads. Filesystem callbacks may run concurrently — implementations
+must be thread-safe.
 
-Not yet wired up: FUSE notifications (the `FUSE_OVER_IO_URING_NOTIFY`
-path from `fusex-uring-notify.patch`), FORGET (the kernel doesn't
-emit it for fusex yet — server-driven invalidation via
-`FUSE_NOTIFY_INVAL_*`).
+Everything is io_uring only, in both directions. The daemon registers
+its ring entries between `fsconfig(SET_FD)` and `fsconfig(CMD_CREATE)`
+and the mount-time handshake (INIT/LOOKUP_ROOT/STATX) already comes over
+them. `read()`/`write()` on `/dev/fuse` fail for a fusex connection.
 
-Note that at the moment of this writing fusex is not upstream and
-needs a patch to send all operation exclusively over io-uring.
+Notifications (`Session::notify_*()`) go over `FUSE_IO_URING_CMD_NOTIFY`
+on a ring of their own. See `<fex/session.hpp>`.
+
+Note that at the moment of this writing fusex is not upstream and needs
+the patches on top of it to work this way.
 
 ## Requirements
 
@@ -134,8 +136,17 @@ To unmount:
 sudo umount /tmp/mnt
 ```
 
-…or kill the daemon — the kernel will see `read(/dev/fuse) == 0` and
-the session loop returns cleanly.
+…or stop the daemon: on SIGINT or SIGTERM it writes back what is dirty
+and unmounts.
+
+## Testing
+
+`build/fex-notify-test <empty_dir>` needs root and a kernel with fusex. It
+mounts an in-memory filesystem, runs some basic operations through the
+kernel and then checks every notification: it changes the server's state,
+checks that the kernel still shows its cache, sends the notification and
+checks that the kernel shows the change. It reports each check and exits
+non-zero if one fails.
 
 ## Design notes — why not libfuse?
 
@@ -147,8 +158,8 @@ that make a fresh library cheaper than reshaping libfuse:
   `fi->fh` plumbing has nothing to track.
 * **`FUSE_LOOKUP_ROOT` happens during mount.** The daemon must answer
   it (and the immediate follow-up `FUSE_STATX`) inside
-  `fsconfig(CMD_CREATE)`. Our `Session::run()` spawns the mount on a
-  helper thread so the main thread can service these in time.
+  `fsconfig(CMD_CREATE)`. Our `Session::run()` runs the mount on a
+  helper thread while the ring workers serve these.
 * **`FUSE_MKOBJX`** collapses CREATE/MKDIR/MKNOD/SYMLINK/TMPFILE into
   one opcode keyed on `mode & S_IFMT`. We expose it as a single
   `mkobjx()` callback rather than five.
@@ -156,7 +167,7 @@ that make a fresh library cheaper than reshaping libfuse:
   Our `link()` returns `std::expected<void, Errc>`, not an `EntryOut`.
 * **Server-driven invalidation.** The kernel ignores `entry_valid` /
   `attr_valid` timeouts; daemons must emit `FUSE_NOTIFY_INVAL_*` to
-  invalidate. (Notify-out is on the to-do list above.)
+  invalidate, see `Session::notify_*()`.
 * **Sync-INIT is mandatory.** `FUSE_DEV_IOC_SYNC_INIT` must be issued
   on the `/dev/fuse` fd before passing it to `fsconfig`.
   `fex::open_fex_device()` does this for you.

@@ -26,6 +26,7 @@ add_library(fex
     src/handlers.cpp
     src/mount.cpp
     src/uring_worker.cpp
+    src/notifier.cpp
     src/reply.cpp)
 
 target_include_directories(fex
@@ -50,6 +51,9 @@ set_target_properties(fex PROPERTIES
 
 add_executable(fex-passthrough examples/passthrough.cpp)
 target_link_libraries(fex-passthrough PRIVATE fex)
+
+add_executable(fex-notify-test examples/notify_test.cpp)
+target_link_libraries(fex-notify-test PRIVATE fex)
 
 # --------------------------------------------------------------- install
 

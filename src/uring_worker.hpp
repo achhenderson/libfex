@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: BSD-2-Clause OR GPL-2.0-only
 //
-// Internal header: per-queue io_uring worker. One RingWorker owns one
-// ring, a contiguous block of entry buffers, and the thread that drives
-// them. Session::run() instantiates one per uring_queues.
+// Internal header: io_uring worker. One RingWorker owns one ring, the
+// entries of the FUSE queues assigned to it, and the thread that drives
+// them. Session::run() instantiates `uring_threads` of them and divides
+// the queues among them.
 //
 // Lives under namespace fex::detail because it is private to the
 // implementation; the public API in <fex/session.hpp> never names it.
@@ -15,6 +16,7 @@
 #include <cstdint>
 #include <system_error>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <liburing.h>
@@ -30,9 +32,10 @@ inline constexpr std::uint64_t kStopSentinel = 0xFFFFFFFFFFFFFFFFull;
 
 class RingWorker {
 public:
-    RingWorker(Session::Impl& impl, unsigned qid, unsigned depth,
+    RingWorker(Session::Impl& impl, std::vector<unsigned> qids, unsigned depth,
                std::size_t payload_bytes)
-        : impl_(impl), qid_(qid), depth_(depth), payload_bytes_(payload_bytes)
+        : impl_(impl), qids_(std::move(qids)), depth_(depth),
+          payload_bytes_(payload_bytes)
     {}
 
     ~RingWorker() { teardown(); }
@@ -69,6 +72,7 @@ private:
         std::byte*    buf       = nullptr;
         std::size_t   buf_len   = 0;
         std::uint64_t commit_id = 0;  // captured from each request
+        unsigned      qid       = 0;  // FUSE queue this entry belongs to
 
         // Stable 2-segment iovec the kernel imports on every
         // REGISTER / COMMIT_AND_FETCH. fuse_uring_create_ring_ent()
@@ -79,12 +83,6 @@ private:
         // so the address handed to the kernel stays valid until the
         // entry is torn down.
         struct iovec iov[2]{};
-
-        // Scratch body buffer for handler dispatch: reassemble
-        // [op_in (128B)] + [payload (payload_sz)] into one contiguous
-        // region so the existing handlers (which expect "body" as a
-        // flat byte stream after fuse_in_header) work unchanged.
-        std::vector<std::byte> body_scratch;
     };
 
     void run();
@@ -105,10 +103,16 @@ private:
     // and from fuse_out_header.len).
     std::uint32_t handle_one(std::uint32_t i) noexcept;
 
-    Session::Impl& impl_;
-    unsigned       qid_;
-    unsigned       depth_;
-    std::size_t    payload_bytes_;
+    Session::Impl&        impl_;
+    std::vector<unsigned> qids_;
+    unsigned              depth_;
+    std::size_t           payload_bytes_;
+
+    // Body buffer for handler dispatch: reassembles [op_in (128B)] +
+    // [payload (payload_sz)] into one contiguous region so the handlers
+    // can treat "body" as a flat byte stream after fuse_in_header. One
+    // per thread: this thread handles one request at a time.
+    std::vector<std::byte> scratch_;
 
     io_uring             ring_{};
     bool                 ring_inited_ = false;
