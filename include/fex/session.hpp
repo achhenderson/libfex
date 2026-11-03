@@ -53,8 +53,7 @@
 namespace fex {
 
 // Owning RAII wrapper for a Unix fd. Exposed because callers occasionally
-// want to peek at the dev fd (e.g. to clone it for an io_uring channel
-// once that support lands).
+// want to peek at the dev fd.
 class UniqueFd {
 public:
     UniqueFd() noexcept = default;
@@ -94,7 +93,6 @@ struct SessionOptions {
 
     // If non-empty, an already-open fd to /dev/fuse; the Session takes
     // ownership. If <0 (default), the Session opens /dev/fuse itself.
-    // Useful for test harnesses that pre-clone fds.
     int  dev_fd = -1;
 
     // ---- io_uring transport ------------------------------------------
@@ -153,8 +151,10 @@ public:
 
     // ---- Notifications ------------------------------------------------
     //
-    // The kernel keeps names, attributes and data until the daemon tells
-    // it they changed, there are no timeouts. These send that message.
+    // The kernel keeps names, attributes and the pages of mappings until
+    // the daemon tells it they changed, there are no timeouts. read(2),
+    // write(2) and readdir(3) always reach the daemon, but only as far as
+    // the size the kernel knows. These send that message.
     //
     // Usable from any thread, also from Filesystem callbacks, while run()
     // is running. They queue the notification and return; the kernel
@@ -167,15 +167,14 @@ public:
     // for a request that is in flight on the same thread.
 
     // Forget the attributes of `nodeid`: the next use fetches them with
-    // statx(). With offset >= 0 also drop its cached data from `offset`,
-    // `length` bytes or to the end if length <= 0. Dirty data is written
-    // back first. For a directory this also drops the readdir cache.
+    // statx(). With offset >= 0 also drop the pages mappings have cached
+    // from `offset`, `length` bytes or to the end if length <= 0. Dirty
+    // pages are written back first.
     std::future<std::error_code>
     notify_inval_inode(NodeId nodeid, std::int64_t offset = 0, std::int64_t length = 0);
 
     // Forget a name in `parent`, positive or negative. Only does something
-    // if the kernel has that name cached: for a name that is new in a
-    // directory also invalidate the directory for the readdir cache.
+    // if the kernel has that name cached.
     std::future<std::error_code>
     notify_inval_entry(NodeId parent, std::string_view name);
 
@@ -184,20 +183,6 @@ public:
     // refers to another object.
     std::future<std::error_code>
     notify_delete(NodeId parent, NodeId child, std::string_view name);
-
-    // Put data into the page cache of a regular file `nodeid`, growing it
-    // if it ends beyond EOF. The copy in the daemon stays authoritative:
-    // this doesn't make the kernel write it back.
-    std::future<std::error_code>
-    notify_store(NodeId nodeid, std::uint64_t offset, std::span<const std::byte> data);
-
-    // Ask for up to `size` bytes from the page cache of a regular file
-    // `nodeid`. What is cached arrives at Filesystem::retrieve_reply()
-    // with this `cookie`, which has to be below 2^61. The future only says
-    // that the request was accepted.
-    std::future<std::error_code>
-    notify_retrieve(NodeId nodeid, std::uint64_t offset, std::uint32_t size,
-                    std::uint64_t cookie);
 
     // Drop the unused cached names of these objects, so that the ones with
     // no name left and no user get their FORGET.

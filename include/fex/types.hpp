@@ -145,14 +145,6 @@ struct MkobjxIn {
 
 constexpr std::uint32_t kMkobjxTmpfile = 1U << 0;
 
-// FOPEN_* flags returned from opendir.
-namespace open_flags {
-inline constexpr std::uint32_t direct_io   = 1U << 0;
-inline constexpr std::uint32_t keep_cache  = 1U << 1;
-inline constexpr std::uint32_t nonseekable = 1U << 2;
-inline constexpr std::uint32_t cache_dir   = 1U << 3;
-}  // namespace open_flags
-
 struct OpenOut {
     FileHandle    fh          = FileHandle{0};
     std::uint32_t open_flags  = 0;

@@ -34,7 +34,8 @@ Functional, multi-threaded over FUSE-over-io_uring. Implements the
 full opcode set the kernel module currently emits:
 lookup/statx/setstatx/mkobjx, unlink/rmdir/rename2/link,
 read/write/readlink, opendir/releasedir/readdir, statfs, fallocate,
-getxattr/setxattr/listxattr/removexattr, plus INIT negotiation.
+fsync/fsyncdir/syncfs, getxattr/setxattr/listxattr/removexattr, plus INIT
+negotiation.
 Includes a worked passthrough example.
 
 Threading: the session spawns `SessionOptions::uring_threads` worker
@@ -142,11 +143,12 @@ and unmounts.
 ## Testing
 
 `build/fex-notify-test <empty_dir>` needs root and a kernel with fusex. It
-mounts an in-memory filesystem, runs some basic operations through the
-kernel and then checks every notification: it changes the server's state,
-checks that the kernel still shows its cache, sends the notification and
-checks that the kernel shows the change. It reports each check and exits
-non-zero if one fails.
+mounts an in-memory filesystem and checks what a daemon can rely on: direct
+reads and writes, mappings and their coherence with those, exec from the
+mount, fsync/syncfs and the daemon's timestamps. Then every notification: it
+changes the server's state, checks that the kernel doesn't know yet, sends
+the notification and checks that the kernel shows the change. It reports each
+check and exits non-zero if one fails.
 
 ## Design notes — why not libfuse?
 
@@ -168,6 +170,14 @@ that make a fresh library cheaper than reshaping libfuse:
 * **Server-driven invalidation.** The kernel ignores `entry_valid` /
   `attr_valid` timeouts; daemons must emit `FUSE_NOTIFY_INVAL_*` to
   invalidate, see `Session::notify_*()`.
+* **The daemon does the caching.** Every `read(2)` and `write(2)` arrives as
+  `FUSE_READ`/`FUSE_WRITE`, directories and symlinks aren't cached either.
+  Only mappings use the page cache: dirty pages come back as ordinary
+  `FUSE_WRITE`s, on `fsync`, `sync` and unmount at the latest. Durability is
+  `fsync()`/`fsyncdir()`/`syncfs()`; without them those calls just succeed.
+  `FUSE_NOTIFY_STORE` and `FUSE_NOTIFY_RETRIEVE` don't exist here.
+* **The daemon owns the timestamps.** The kernel stamps nothing and fetches
+  them with `statx()`: see the conventions in `<fex/filesystem.hpp>`.
 * **Sync-INIT is mandatory.** `FUSE_DEV_IOC_SYNC_INIT` must be issued
   on the `/dev/fuse` fd before passing it to `fsconfig`.
   `fex::open_fex_device()` does this for you.

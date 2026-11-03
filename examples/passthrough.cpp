@@ -233,8 +233,7 @@ public:
     explicit PassthroughFs(Fd backing) : table_(std::move(backing)) {}
 
     std::expected<void, fex::Errc> init(fex::InitInfo& info) override {
-        // Default flags from the dispatcher are fine; we explicitly opt
-        // into PARALLEL_DIROPS already, just leave info.flags alone.
+        // Default flags from the dispatcher are fine, leave info.flags alone.
         // This one always prints because it's the boot-handshake heartbeat.
         std::fprintf(stderr,
             "fex passthrough: kernel %u.%u flags=0x%llx max_ra=%u\n",
@@ -601,6 +600,31 @@ public:
         return {};
     }
 
+    std::expected<void, fex::Errc>
+    fsync(const fex::Context&, fex::NodeId n, fex::FileHandle fh, bool datasync) override
+    {
+        trace("[fex] fsync node=%llu fh=%llu datasync=%d\n", u64(n), u64(fh), datasync);
+        auto io = io_fd(n, fh, O_RDONLY);
+        if (!io) return std::unexpected{io.error()};
+        int r = datasync ? ::fdatasync(io->fd) : ::fsync(io->fd);
+        if (r < 0) return wrap_errno();
+        return {};
+    }
+
+    std::expected<void, fex::Errc>
+    syncfs(const fex::Context&) override {
+        trace("[fex] syncfs\n");
+        auto in = table_.get(fex::NodeId::root);
+        if (!in) return stale();
+        char proc[64];
+        std::snprintf(proc, sizeof(proc), "/proc/self/fd/%d", in->path_fd.get());
+        // syncfs() doesn't take the O_PATH fd.
+        Fd fd{::open(proc, O_DIRECTORY | O_RDONLY | O_CLOEXEC)};
+        if (fd.get() < 0) return wrap_errno();
+        if (::syncfs(fd.get()) < 0) return wrap_errno();
+        return {};
+    }
+
     // File handle table -----------------------------------------------
     //
     // The backing path_fd we cache per inode is O_PATH, which can't do
@@ -669,6 +693,22 @@ public:
             ::closedir(it->second);
             dirs_.erase(it);
         }
+        return {};
+    }
+
+    std::expected<void, fex::Errc>
+    fsyncdir(const fex::Context&, fex::NodeId n, fex::FileHandle fh, bool datasync) override
+    {
+        trace("[fex] fsyncdir node=%llu fh=%llu datasync=%d\n", u64(n), u64(fh), datasync);
+        int fd;
+        {
+            std::lock_guard lk(dirs_mu_);
+            auto it = dirs_.find(fex::to_underlying(fh));
+            if (it == dirs_.end()) return std::unexpected{fex::Errc::bad_file_descriptor};
+            fd = ::dirfd(it->second);
+        }
+        int r = datasync ? ::fdatasync(fd) : ::fsync(fd);
+        if (r < 0) return wrap_errno();
         return {};
     }
 
@@ -773,8 +813,8 @@ public:
 
 private:
     // Look up the cached fd for an open regular file. Returns -1 if
-    // `fh` is the zero sentinel (writeback writes etc.) or not in the
-    // table.
+    // `fh` is the zero sentinel, which is what the kernel sends for
+    // regular files, or not in the table.
     int file_fd(fex::FileHandle fh) const {
         if (fex::to_underlying(fh) == 0) return -1;
         std::shared_lock lk(files_mu_);
@@ -784,7 +824,7 @@ private:
 
     // Resolve `fh` to an fd usable at `mode`. If `fh` is live the
     // returned `owner` is empty and `fd` is borrowed from the files_
-    // table. If `fh` is the writeback-style zero sentinel, re-open the
+    // table. If `fh` is the zero sentinel, re-open the
     // inode's O_PATH fd via /proc/self/fd; `owner` keeps that fd alive
     // until the caller's scope ends.
     struct IoFd { int fd; Fd owner; };

@@ -35,10 +35,6 @@ namespace fex {
 
 namespace detail { class Notifier; }
 
-// notify_unique of a FUSE_NOTIFY_RETRIEVE: the cookie shifted past
-// FUSE_INT_REQ_BIT, above the unique values the kernel uses.
-inline constexpr std::uint64_t kRetrieveUnique = 1ull << 62;
-
 // -----------------------------------------------------------------------
 // Replier
 //
@@ -196,7 +192,8 @@ struct Session::Impl {
     void handle_setxattr   (const ::fuse_in_header&, const std::byte*, std::size_t, Replier&);
     void handle_listxattr  (const ::fuse_in_header&, const std::byte*, std::size_t, Replier&);
     void handle_removexattr(const ::fuse_in_header&, const std::byte*, std::size_t, Replier&);
-    void handle_notify_reply(const ::fuse_in_header&, const std::byte*, std::size_t, Replier&);
+    void handle_fsync      (const ::fuse_in_header&, const std::byte*, std::size_t, Replier&, bool is_dir);
+    void handle_syncfs     (const ::fuse_in_header&, const std::byte*, std::size_t, Replier&);
 
     // Pure dispatch: pick the handler by h.opcode and call it. No I/O.
     void dispatch(const ::fuse_in_header& h,

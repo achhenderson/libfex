@@ -111,12 +111,9 @@ void Session::Impl::handle_init(
         info.max_pages,
         (opts.uring_payload_bytes + 4095u) / 4096u));
 
-    // Sane defaults: advertise EXT (required by fusex), enable URING,
-    // request PARALLEL_DIROPS for concurrent lookups, and ack
-    // WRITEBACK_CACHE so the kernel can update mtime/ctime/size
-    // locally and batch flushes through writepages.
-    info.flags = FUSE_INIT_EXT | FUSE_MAX_PAGES | FUSE_PARALLEL_DIROPS
-               | FUSE_OVER_IO_URING | FUSE_WRITEBACK_CACHE;
+    // The two flags fusex looks at, it requires both. max_write and
+    // max_pages count without a flag.
+    info.flags = FUSE_INIT_EXT | FUSE_OVER_IO_URING;
 
     if (auto rc = fs->init(info); !rc) { reply_error(r, rc.error()); return; }
 
@@ -139,8 +136,6 @@ void Session::Impl::handle_init(
     out.max_readahead  = in->max_readahead;
     out.flags          = static_cast<std::uint32_t>(info.flags & 0xffffffffu);
     out.flags2         = static_cast<std::uint32_t>(info.flags >> 32);
-    out.max_background       = 64;
-    out.congestion_threshold = 48;
     out.max_write      = info.max_write;
     out.time_gran      = info.time_gran;
     out.max_pages      = info.max_pages;
@@ -553,7 +548,7 @@ void Session::Impl::handle_opendir(
 
     ::fuse_open_out out{};
     out.fh         = to_underlying(rv->fh);
-    out.open_flags = rv->open_flags | FOPEN_CACHE_DIR;  // kernel forces it
+    out.open_flags = rv->open_flags;
     // backing_id is zero by value-init; we don't use FOPEN_PASSTHROUGH,
     // and the field is absent on pre-6.10 <linux/fuse.h>.
     reply_pod(r, out);
@@ -695,18 +690,27 @@ void Session::Impl::handle_removexattr(
     reply_ok(r);
 }
 
-void Session::Impl::handle_notify_reply(
+void Session::Impl::handle_fsync(
     const ::fuse_in_header& h, const std::byte* body, std::size_t body_len,
-    Replier& r)
+    Replier& r, bool is_dir)
 {
-    // Wire: [fuse_notify_retrieve_in][data]. The kernel doesn't wait for
-    // a reply, but the ring entry only comes back with the commit.
-    const auto* in = in_arg<::fuse_notify_retrieve_in>(h, body, body_len);
-    if (in && body_len - sizeof(*in) >= in->size) {
-        fs->retrieve_reply(make_ctx(h), static_cast<NodeId>(h.nodeid),
-                           (h.unique & ~kRetrieveUnique) >> 1, in->offset,
-                           std::span<const std::byte>{body + sizeof(*in), in->size});
-    }
+    const auto* in = in_arg<::fuse_fsync_in>(h, body, body_len);
+    if (!in) { reply_error(r, Errc::invalid_argument); return; }
+
+    const bool datasync = (in->fsync_flags & FUSE_FSYNC_FDATASYNC) != 0;
+    const auto nodeid = static_cast<NodeId>(h.nodeid);
+    const auto fh = static_cast<FileHandle>(in->fh);
+    auto rv = is_dir ? fs->fsyncdir(make_ctx(h), nodeid, fh, datasync)
+                     : fs->fsync(make_ctx(h), nodeid, fh, datasync);
+    if (!rv) { reply_error(r, rv.error()); return; }
+    reply_ok(r);
+}
+
+void Session::Impl::handle_syncfs(
+    const ::fuse_in_header& h, const std::byte*, std::size_t, Replier& r)
+{
+    auto rv = fs->syncfs(make_ctx(h));
+    if (!rv) { reply_error(r, rv.error()); return; }
     reply_ok(r);
 }
 
@@ -749,7 +753,9 @@ void Session::Impl::dispatch(const ::fuse_in_header& h,
     case FUSE_SETXATTR:    handle_setxattr   (h, body, body_len, r); break;
     case FUSE_LISTXATTR:   handle_listxattr  (h, body, body_len, r); break;
     case FUSE_REMOVEXATTR: handle_removexattr(h, body, body_len, r); break;
-    case FUSE_NOTIFY_REPLY: handle_notify_reply(h, body, body_len, r); break;
+    case FUSE_FSYNC:       handle_fsync      (h, body, body_len, r, false); break;
+    case FUSE_FSYNCDIR:    handle_fsync      (h, body, body_len, r, true);  break;
+    case FUSE_SYNCFS:      handle_syncfs     (h, body, body_len, r); break;
     // Nothing to do yet: Session::run() calls Filesystem::destroy() once
     // the workers have stopped.
     case FUSE_DESTROY:     reply_ok(r); break;

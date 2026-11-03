@@ -20,8 +20,20 @@
 //
 // - The default implementations all return std::errc::function_not_supported
 //   so daemons override only what they need. The kernel doesn't open
-//   regular files on the daemon: reads/writes/fallocate arrive with
+//   regular files on the daemon: reads/writes/fallocate/fsync arrive with
 //   fh=FileHandle{0}.
+//
+// - Caching file data is the daemon's business. Every read(2) and write(2)
+//   arrives here, the kernel keeps no copy. Only mappings use its page cache:
+//   a fault reads whole pages, and dirty pages come back as ordinary writes.
+//   fsync() and syncfs() are how the kernel asks for durability.
+//
+// - The timestamps are the daemon's too. The kernel stamps nothing and takes
+//   what statx() returns after an operation that changes them. So a write or
+//   fallocate has to update mtime and ctime; a create, link, unlink or rename
+//   those of the directories and the ctime of the object; an xattr change the
+//   ctime; a read or readdir the atime, if the daemon keeps one. setstatx()
+//   gets the times to set in its argument.
 
 #pragma once
 
@@ -89,8 +101,9 @@ public:
     }
 
     // FUSE_STATX (opcode 52): produce the full attribute set for nodeid.
-    // The kernel ignores attr_valid timeouts in fusex — invalidation is
-    // server-driven via FUSE_NOTIFY_INVAL_INODE.
+    // The kernel ignores attr_valid timeouts in fusex. It asks again after
+    // an operation of its own that changes attributes, and otherwise when
+    // the server invalidates them with FUSE_NOTIFY_INVAL_INODE.
     virtual std::expected<StatxOut, Errc>
     statx(const Context& ctx, NodeId nodeid) = 0;
 
@@ -152,7 +165,7 @@ public:
     }
 
     // FUSE_READLINK (opcode 5). Return the link body. Note: max length
-    // is bounded by what the kernel asked for (one folio - 1).
+    // is bounded by what the kernel asked for (one page - 1).
     virtual std::expected<std::string, Errc>
     readlink(const Context& ctx, NodeId nodeid) {
         (void)ctx; (void)nodeid;
@@ -174,9 +187,10 @@ public:
         return {};
     }
 
-    // FUSE_READ (opcode 15). Fill `out` with up to `out.size()` bytes
-    // starting at `offset`. Return the number actually written. The
-    // kernel zero-fills the tail if the daemon returns short. `fh` is 0.
+    // FUSE_READ (opcode 15): a read(2), or a fault reading a mapped page.
+    // Fill `out` with up to `out.size()` bytes starting at `offset`. Return
+    // the number actually written. A short count ends the read(2) there,
+    // the rest of a mapped page reads as zeros. `fh` is 0.
     virtual std::expected<std::size_t, Errc>
     read(const Context& ctx, NodeId nodeid, FileHandle fh,
          std::uint64_t offset, std::span<std::byte> out) {
@@ -184,9 +198,11 @@ public:
         return std::unexpected{Errc::function_not_supported};
     }
 
-    // FUSE_WRITE (opcode 16). Consume `in` starting at `offset`.
-    // Return the number of bytes accepted; the kernel verifies that
-    // it equals `in.size()` and -EIOs the request otherwise. `fh` is 0.
+    // FUSE_WRITE (opcode 16): a write(2), or the writeback of a dirty mapped
+    // page, which is a whole page and comes with uid and gid 0. Consume `in`
+    // starting at `offset`. Return the number of bytes accepted. A short
+    // count ends the write(2) there and fails the writeback; accepting
+    // nothing is -EIO for the caller. `fh` is 0.
     virtual std::expected<std::size_t, Errc>
     write(const Context& ctx, NodeId nodeid, FileHandle fh,
           std::uint64_t offset, std::span<const std::byte> in) {
@@ -204,6 +220,33 @@ public:
         return std::unexpected{Errc::function_not_supported};
     }
 
+    // FUSE_FSYNC (opcode 20): make what the daemon has for `nodeid` durable,
+    // with `datasync` only what it takes to read the data back. fsync(2),
+    // msync(2) and O_SYNC writes end up here, after the dirty mapped pages
+    // were written. The error goes to the caller. Without an implementation
+    // those calls succeed and promise nothing. `fh` is 0.
+    virtual std::expected<void, Errc>
+    fsync(const Context& ctx, NodeId nodeid, FileHandle fh, bool datasync) {
+        (void)ctx; (void)nodeid; (void)fh; (void)datasync;
+        return std::unexpected{Errc::function_not_supported};
+    }
+
+    // FUSE_FSYNCDIR (opcode 30): the same for a directory, `fh` is what
+    // opendir() returned.
+    virtual std::expected<void, Errc>
+    fsyncdir(const Context& ctx, NodeId nodeid, FileHandle fh, bool datasync) {
+        (void)ctx; (void)nodeid; (void)fh; (void)datasync;
+        return std::unexpected{Errc::function_not_supported};
+    }
+
+    // FUSE_SYNCFS (opcode 50): make everything durable. sync(2), syncfs(2) and
+    // an unmount end up here, after the dirty mapped pages were written.
+    virtual std::expected<void, Errc>
+    syncfs(const Context& ctx) {
+        (void)ctx;
+        return std::unexpected{Errc::function_not_supported};
+    }
+
     // FUSE_STATFS (opcode 17). No nodeid context needed (statfs on
     // mount root), but the kernel still passes it for consistency.
     virtual std::expected<StatfsOut, Errc>
@@ -213,8 +256,7 @@ public:
     }
 
     // FUSE_OPENDIR (opcode 27) / FUSE_RELEASEDIR (opcode 29). The fusex
-    // kernel forces FOPEN_CACHE_DIR on the reply regardless of what the
-    // daemon returns, so most daemons can leave open_flags=0.
+    // kernel only uses the fh of the reply.
     virtual std::expected<OpenOut, Errc>
     opendir(const Context& ctx, NodeId nodeid) {
         (void)ctx; (void)nodeid;
@@ -229,7 +271,8 @@ public:
 
     // FUSE_READDIR (opcode 28). Pack as many entries as fit. `offset`
     // is the value returned in DirentWriter::add(off=...) for the
-    // previous entry, or zero for the first call.
+    // previous entry, or zero for the first call. The kernel doesn't
+    // cache directories: a new name shows up in the next readdir(3).
     virtual std::expected<void, Errc>
     readdir(const Context& ctx, NodeId nodeid, FileHandle fh,
             std::uint64_t offset, DirentWriter& out) {
@@ -269,15 +312,6 @@ public:
     removexattr(const Context& ctx, NodeId nodeid, std::string_view name) {
         (void)ctx; (void)nodeid; (void)name;
         return std::unexpected{Errc::function_not_supported};
-    }
-
-    // FUSE_NOTIFY_REPLY (opcode 41): the answer to Session::notify_retrieve().
-    // `data` is what the kernel had cached from `offset` on, possibly less
-    // than was asked for or nothing.
-    virtual void retrieve_reply(const Context& ctx, NodeId nodeid, std::uint64_t cookie,
-                                std::uint64_t offset,
-                                std::span<const std::byte> data) noexcept {
-        (void)ctx; (void)nodeid; (void)cookie; (void)offset; (void)data;
     }
 };
 

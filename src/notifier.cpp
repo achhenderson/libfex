@@ -264,42 +264,6 @@ Session::notify_delete(NodeId parent, NodeId child, std::string_view name)
 }
 
 std::future<std::error_code>
-Session::notify_store(NodeId nodeid, std::uint64_t offset, std::span<const std::byte> data)
-{
-    if (data.size() > std::numeric_limits<std::uint32_t>::max())
-        return ready_error(EINVAL);
-
-    ::fuse_notify_store_out out{};
-    out.nodeid = to_underlying(nodeid);
-    out.offset = offset;
-    out.size   = static_cast<std::uint32_t>(data.size());
-
-    std::vector<std::byte> v;
-    v.reserve(sizeof(out) + data.size());
-    append(v, out);
-    v.insert(v.end(), data.begin(), data.end());
-    return impl_->notifier->post(FUSE_NOTIFY_STORE, std::move(v));
-}
-
-std::future<std::error_code>
-Session::notify_retrieve(NodeId nodeid, std::uint64_t offset, std::uint32_t size,
-                         std::uint64_t cookie)
-{
-    if (cookie >= kRetrieveUnique >> 1)
-        return ready_error(EINVAL);
-
-    ::fuse_notify_retrieve_out out{};
-    out.notify_unique = kRetrieveUnique | (cookie << 1);
-    out.nodeid = to_underlying(nodeid);
-    out.offset = offset;
-    out.size   = size;
-
-    std::vector<std::byte> v;
-    append(v, out);
-    return impl_->notifier->post(FUSE_NOTIFY_RETRIEVE, std::move(v));
-}
-
-std::future<std::error_code>
 Session::notify_prune(std::span<const NodeId> nodeids)
 {
     if (nodeids.size() > std::numeric_limits<std::uint32_t>::max())
