@@ -38,7 +38,7 @@ $(SO): $(LIB_OBJS)
 	ln -sf libfex.so.0.1.0 $(BUILD)/libfex.so.0
 	ln -sf libfex.so.0     $(BUILD)/libfex.so
 
-$(BIN): examples/passthrough.cpp $(LIB)
+$(BIN): examples/passthrough.cpp examples/daemonize.hpp $(LIB)
 	$(CXX) $(CXXFLAGS) $< $(LIB) -o $@ $(LDFLAGS)
 
 $(TEST): examples/notify_test.cpp $(LIB)
