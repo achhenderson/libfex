@@ -16,13 +16,14 @@ LIB        := $(BUILD)/libfex.a
 SO         := $(BUILD)/libfex.so.0.1.0
 BIN        := $(BUILD)/fex-passthrough
 TEST       := $(BUILD)/fex-notify-test
+MEMFS      := $(BUILD)/fex-memfs
 
 LIB_SRCS   := src/session.cpp src/handlers.cpp src/mount.cpp \
               src/uring_worker.cpp src/notifier.cpp src/reply.cpp
 LIB_OBJS   := $(LIB_SRCS:%.cpp=$(BUILD)/%.o)
 
 .PHONY: all clean install
-all: $(LIB) $(SO) $(BIN) $(TEST)
+all: $(LIB) $(SO) $(BIN) $(TEST) $(MEMFS)
 
 $(BUILD)/%.o: %.cpp
 	@mkdir -p $(@D)
@@ -44,6 +45,9 @@ $(BIN): examples/passthrough.cpp examples/daemonize.hpp $(LIB)
 $(TEST): examples/notify_test.cpp $(LIB)
 	$(CXX) $(CXXFLAGS) $< $(LIB) -o $@ $(LDFLAGS)
 
+$(MEMFS): examples/memfs.cpp examples/daemonize.hpp $(LIB)
+	$(CXX) $(CXXFLAGS) $< $(LIB) -o $@ $(LDFLAGS)
+
 -include $(LIB_OBJS:.o=.d)
 
 clean:
@@ -58,4 +62,4 @@ install: all
 	install -m 0644 $(LIB) $(DESTDIR)$(PREFIX)/lib/
 	install -m 0644 include/fex/*.h include/fex/*.hpp \
 	    $(DESTDIR)$(PREFIX)/include/fex/
-	install -m 0755 $(BIN) $(DESTDIR)$(PREFIX)/bin/
+	install -m 0755 $(BIN) $(MEMFS) $(DESTDIR)$(PREFIX)/bin/

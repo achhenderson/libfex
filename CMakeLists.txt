@@ -55,6 +55,9 @@ target_link_libraries(fex-passthrough PRIVATE fex)
 add_executable(fex-notify-test examples/notify_test.cpp)
 target_link_libraries(fex-notify-test PRIVATE fex)
 
+add_executable(fex-memfs examples/memfs.cpp)
+target_link_libraries(fex-memfs PRIVATE fex)
+
 # --------------------------------------------------------------- install
 
 include(GNUInstallDirs)
@@ -66,5 +69,5 @@ install(TARGETS fex
 install(DIRECTORY include/fex
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 
-install(TARGETS fex-passthrough
+install(TARGETS fex-passthrough fex-memfs
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})

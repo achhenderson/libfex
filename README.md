@@ -71,7 +71,7 @@ the patches on top of it to work this way.
 Either:
 
 ```sh
-make -j$(nproc)            # → build/libfex.{a,so,so.0,so.0.1.0}, build/fex-passthrough
+make -j$(nproc)            # → build/libfex.{a,so,so.0,so.0.1.0}, build/fex-passthrough, build/fex-memfs
 sudo make install          # → /usr/local
 ```
 
@@ -139,6 +139,35 @@ sudo umount /tmp/mnt
 
 …or stop the daemon: on SIGINT or SIGTERM it writes back what is dirty
 and unmounts.
+
+## In-memory example
+
+```sh
+mkdir -p /tmp/mnt
+build/fex-memfs /tmp/mnt       # -f to stay in the foreground
+```
+
+`fex-memfs` is the counterpart of libfuse's `memfs_ll`: everything lives in
+the daemon and is gone when it ends. The data of a regular file is in a memfd,
+so it is sparse and swappable, and takes one file descriptor per file. It does
+what the kernel asks of a daemon: directories, hard links and symlinks, special
+files, `O_TMPFILE`, all the `RENAME_*` flags, xattrs and so ACLs, `fallocate`,
+and the timestamps. `df` shows the machine's memory.
+
+Options, with `-o`:
+
+| Option | Meaning |
+|---|---|
+| `max_write=N` | largest request in bytes, default from `/proc/sys/fs/fuse/max_pages_limit` |
+| `threads=N`, `queue_depth=N` | ring worker threads, entries per queue |
+| `null_io` | no data store, to measure the interface: writes read the buffer, reads return random data, files remember only their size |
+| `debug_io` | log every read and write to stderr with a timestamp |
+| `notify_inval` | a thread fires storms of invalidations at random files the kernel knows, as peer nodes would |
+| `notify_interval_ms=N` | longest delay between storms, default 1000 |
+| `notify_storm=N` | invalidations per storm, default 64 |
+
+The `memfs_ll` options for the page cache and passthrough don't apply: fusex
+has neither on the data path.
 
 ## Testing
 
