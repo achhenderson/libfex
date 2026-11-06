@@ -757,7 +757,9 @@ public:
         char proc[64];
         std::snprintf(proc, sizeof(proc), "/proc/self/fd/%d", in->path_fd.get());
         std::string nm{name};
-        ssize_t r = ::lgetxattr(proc, nm.c_str(), out.data(), out.size());
+        // The /proc link must be followed to reach the object; the l*
+        // variants would act on the link itself (EPERM for user.* names).
+        ssize_t r = ::getxattr(proc, nm.c_str(), out.data(), out.size());
         if (r < 0) return wrap_errno();
         return static_cast<std::size_t>(r);
     }
@@ -774,8 +776,8 @@ public:
         char proc[64];
         std::snprintf(proc, sizeof(proc), "/proc/self/fd/%d", in->path_fd.get());
         std::string nm{name};
-        if (::lsetxattr(proc, nm.c_str(), value.data(), value.size(),
-                        (int)flags) < 0)
+        if (::setxattr(proc, nm.c_str(), value.data(), value.size(),
+                       (int)flags) < 0)
             return wrap_errno();
         return {};
     }
@@ -789,9 +791,9 @@ public:
         if (!in) return stale();
         char proc[64];
         std::snprintf(proc, sizeof(proc), "/proc/self/fd/%d", in->path_fd.get());
-        ssize_t r = ::llistxattr(proc,
-                                 reinterpret_cast<char*>(out.data()),
-                                 out.size());
+        ssize_t r = ::listxattr(proc,
+                                reinterpret_cast<char*>(out.data()),
+                                out.size());
         if (r < 0) return wrap_errno();
         return static_cast<std::size_t>(r);
     }
@@ -807,7 +809,7 @@ public:
         char proc[64];
         std::snprintf(proc, sizeof(proc), "/proc/self/fd/%d", in->path_fd.get());
         std::string nm{name};
-        if (::lremovexattr(proc, nm.c_str()) < 0) return wrap_errno();
+        if (::removexattr(proc, nm.c_str()) < 0) return wrap_errno();
         return {};
     }
 
